@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException
+import asyncio
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
@@ -24,9 +25,9 @@ groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 # Partner Database
 VALID_SITE_KEYS = {
-    "partner-alpha": {"name": "Alpha Security", "connector": "xon"},
-    "partner-beta": {"name": "Beta Privacy", "connector": "hibp"},
-    "xon-internal": {"name": "XON Dashboard", "connector": "xon"}
+    "partner-alpha": {"name": "Alpha Security", "connectors": ["xon"]},
+    "partner-beta": {"name": "Beta Privacy", "connectors": ["hibp"]},
+    "xon-internal": {"name": "XON Dashboard", "connectors": ["xon", "hibp"]}
 }
 
 class Message(BaseModel):
@@ -45,30 +46,39 @@ async def chat_endpoint(request: ChatRequest):
         raise HTTPException(status_code=403, detail="Invalid Site Key")
 
     user_msg = request.messages[-1].content.strip()
-    connector_type = partner["connector"]
+    connector_types = partner["connectors"]
 
-    # 2. Connector Logic
-    if connector_type == "hibp":
-        connector = HIBPConnector()
-    else:
-        connector = XONConnector()
-
+    # 2. Aggregated Connector Logic
     if "@" in user_msg:
         # Extract email
         email = next((w for w in user_msg.split() if "@" in w), user_msg)
-        breaches = await connector.check_email(email)
         
+        # Instantiate connectors
+        instances = []
+        for ctype in connector_types:
+            if ctype == "hibp":
+                instances.append(HIBPConnector())
+            else:
+                instances.append(XONConnector())
+
+        # Fetch in parallel
+        results = await asyncio.gather(*[inst.check_email(email) for inst in instances])
+        
+        # Format for AI
+        aggregated_data = ""
+        for i, res in enumerate(results):
+            aggregated_data += f"- {connector_types[i].upper()} Results: {res}\n"
+
         system_prompt = f"""
         You are the XON AI Security Assistant.
         Partner: {partner['name']}
-        Data Source: {connector_type.upper()}
-        Context: User checked email. Redacted for privacy.
-        Breach Data: {breaches}
+        Aggregated Context from {len(connector_types)} sources:
+        {aggregated_data}
         
         Rules:
-        - If breaches is 'None', congratulate and give a tip.
-        - If breaches exist, list them and give 3 recovery steps.
-        - Professional, concise, under 150 words.
+        - If ALL sources say 'None', congratulate and give a tip.
+        - If breaches exist in ANY source, list them clearly and give 3 recovery steps.
+        - Professional, concise, under 180 words.
         """
     else:
         system_prompt = f"You are the XON AI Security Assistant serving {partner['name']}. Answer security questions accurately."
